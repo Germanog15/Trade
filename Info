@@ -1,0 +1,138 @@
+with unpair_trade_token as
+(
+    select * from
+    (
+    VALUES 
+        ('ethereum', 'WETH'),
+        ('fantom', 'WFTM'),
+        ('zora', 'WETH'),
+        ('avalanche_c', 'WAVAX'),
+        ('linea', 'WETH'),
+        ('gnosis', 'XDAI'),
+        ('optimism', 'WETH'),
+        ('zkevm', 'WETH'),
+        ('polygon', 'WMATIC'),
+        ('scroll', 'WETH'),
+        ('base', 'WETH'),
+        ('arbitrum', 'WETH'),
+        ('zksync', 'WETH'),
+        ('bnb', 'WBNB')
+    ) as subquery (blockchain, symbol)
+), stablecoins as
+(
+    select 'USDC' as symbol union all
+    select 'USDT' union all
+    select 'DAI'
+), all_trades AS (
+    SELECT * 
+    FROM dex.trades
+    WHERE tx_from={{wallet}}
+        and (token_bought_address = {{Contract Address}} or token_sold_address = {{Contract Address}})
+), all_buys AS (
+    SELECT 
+       block_time
+     ,'buy' as trade_type
+     , blockchain
+     , project
+     , token_bought_symbol AS symbol
+     , amount_usd as amount_usd
+     , amount_usd/token_bought_amount AS token_usd_price
+     , token_bought_amount
+     , token_bought_address AS token_address
+    FROM all_trades
+    WHERE 
+            token_bought_symbol not in (select symbol from stablecoins)
+        and token_bought_symbol not in (select utt.symbol from unpair_trade_token utt where utt.blockchain = all_trades.blockchain)
+), all_sells AS(
+    SELECT 
+       block_time
+     ,'sell' as trade_type
+     , blockchain
+     , project
+     , token_sold_symbol AS symbol
+     , amount_usd
+     , amount_usd/token_sold_amount AS token_usd_price
+     , token_sold_amount
+     , token_sold_address AS token_address
+    FROM all_trades
+    WHERE 
+            token_sold_symbol not in (select symbol from stablecoins)
+        and token_sold_symbol not in (select utt.symbol from unpair_trade_token utt where utt.blockchain = all_trades.blockchain)
+), union_all_buys_sells AS(
+    SELECT cast(block_time as date) as _date
+        , trade_type
+        , blockchain
+        , project
+        , symbol
+        , token_address
+        , sum(amount_usd) as amount_usd
+        , avg(token_usd_price) as token_usd_price
+        , sum(token_bought_amount) as token_amount
+    FROM all_buys
+    group by 1, 2, 3, 4, 5, 6
+    UNION ALL
+    SELECT cast(block_time as date) as _date
+        , trade_type
+        , blockchain
+        , project
+        , symbol
+        , token_address
+        , sum(amount_usd) as amount_usd
+        , avg(token_usd_price) as token_usd_price
+        , sum(token_sold_amount) as token_amount
+    FROM all_sells
+    group by 1, 2, 3, 4, 5, 6
+), token_price as
+(
+    select cast(minute as date) as _date
+        , avg(price) as price
+    from prices.usd
+    where contract_address = {{Contract Address}}
+        and cast(minute as date) > (select min(_date) from union_all_buys_sells) - interval '1' month
+    group by 1
+), token_price_all as
+(
+    select *
+    from token_price
+    union all
+    SELECT block_date as _date
+        , avg(amount_usd / token_bought_amount) as price
+    FROM dex.trades
+    WHERE tx_from={{wallet}}
+        and token_bought_address = {{Contract Address}} -- or token_sold_address = {{Contract Address}})
+        and block_date not in (select _date from token_price)
+    group by 1
+), summary as
+(
+    SELECT prc.*
+        , sum(case when trade_type = 'buy' then amount_usd else 0 end) as buy_amount_usd
+        , sum(case when trade_type = 'sell' then amount_usd else 0 end) as sell_amount_usd
+        , sum(case when trade_type = 'buy' then token_amount else 0 end) as buy_amount
+        , sum(case when trade_type = 'sell' then token_amount else 0 end) as sell_amount
+        --, trade_type
+        --, token_amount
+        --, amount_usd
+    FROM token_price_all prc
+    left join union_all_buys_sells bs on prc._date = bs._date
+    group by 1, 2
+), summary2 as
+(
+    select *
+        , (select min(_date) from summary where sell_amount_usd > 0) as first_sell_date
+        , (case when sell_amount_usd > 0 then sum(sell_amount_usd - buy_amount_usd) over (order by _date) else 0 end) as PnL_realized
+        , sum(buy_amount - sell_amount) over (order by _date) as hold_amount
+        , sum(buy_amount - sell_amount) over (order by _date) * price as PnL_unrealized_usd
+    from summary
+)
+select _date
+    , price
+    , buy_amount_usd
+    , sell_amount_usd
+    , buy_amount
+    , sell_amount
+    , sum(case when first_sell_date = _date then PnL_realized else 0 end) over (order by _date) as PnL_realized_usd
+    , hold_amount
+    , PnL_unrealized_usd
+    , (sum(case when first_sell_date = _date then PnL_realized else 0 end) over (order by _date)) + PnL_unrealized_usd as PnL_total_usd
+from summary2
+order by _date
